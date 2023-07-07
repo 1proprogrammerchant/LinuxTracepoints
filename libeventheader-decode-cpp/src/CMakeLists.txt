@@ -1,24 +1,17 @@
 # eventheader-decode = libeventheader-decode, DECODE_HEADERS
 add_library(eventheader-decode
     EventEnumerator.cpp
-    EventFormatter.cpp
-    PerfDataAbi.cpp
-    PerfDataFile.cpp
-    PerfDataReader.cpp
-    PerfEventMetadata.cpp)
+    EventFormatter.cpp)
 target_include_directories(eventheader-decode
     PUBLIC
     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 target_link_libraries(eventheader-decode
-    PUBLIC eventheader-headers)
+    PUBLIC eventheader-headers
+    PRIVATE tracepoint-decode)
 set(DECODE_HEADERS
     "${PROJECT_SOURCE_DIR}/include/eventheader/EventEnumerator.h"
-    "${PROJECT_SOURCE_DIR}/include/eventheader/EventFormatter.h"
-    "${PROJECT_SOURCE_DIR}/include/PerfDataDecode/PerfDataAbi.h"
-    "${PROJECT_SOURCE_DIR}/include/PerfDataDecode/PerfDataFile.h"
-    "${PROJECT_SOURCE_DIR}/include/PerfDataDecode/PerfDataReader.h"
-    "${PROJECT_SOURCE_DIR}/include/PerfDataDecode/PerfEventMetadata.h")
+    "${PROJECT_SOURCE_DIR}/include/eventheader/EventFormatter.h")
 set_target_properties(eventheader-decode PROPERTIES
     PUBLIC_HEADER "${DECODE_HEADERS}")
 target_compile_features(eventheader-decode
@@ -35,6 +28,10 @@ configure_package_config_file(
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/eventheader-decode"
     NO_SET_AND_CHECK_MACRO
     NO_CHECK_REQUIRED_COMPONENTS_MACRO)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/eventheader-decodeConfigVersion.cmake"
+    COMPATIBILITY SameMinorVersion)
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/eventheader-decodeConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/eventheader-decodeConfigVersion.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/eventheader-decode")

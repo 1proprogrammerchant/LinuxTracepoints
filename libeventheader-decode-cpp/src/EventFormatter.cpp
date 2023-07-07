@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 #include <eventheader/EventFormatter.h>
-#include <PerfDataDecode/PerfEventMetadata.h>
-#include <PerfDataDecode/PerfDataFile.h>
-#include <PerfDataDecode/PerfDataAbi.h>
+#include <tracepoint/PerfEventMetadata.h>
+#include <tracepoint/PerfEventInfo.h>
+#include <tracepoint/PerfByteReader.h>
+#include <tracepoint/PerfEventAbi.h>
 
 #include <assert.h>
 #include <math.h>
@@ -48,11 +49,8 @@
 #endif
 
 using namespace std::string_view_literals;
-
-static auto constexpr HostEndianFlag =
-    EVENTHEADER_LITTLE_ENDIAN
-    ? eventheader_flag_little_endian
-    : eventheader_flag_none;
+using namespace eventheader_decode;
+using namespace tracepoint_decode;
 
 struct SwapNo
 {
@@ -66,16 +64,6 @@ struct SwapYes
     uint16_t operator()(uint16_t val) const { return bswap_16(val); }
     uint32_t operator()(uint32_t val) const { return bswap_32(val); }
 };
-
-template<class CH>
-static size_t
-UnalignedStrnlen(CH const* pch, size_t cchMax) noexcept
-{
-    CH const UNALIGNED* p = pch;
-    size_t cch;
-    for (cch = 0; cch != cchMax && p[cch] != 0; cch += 1) {}
-    return cch;
-}
 
 class StringBuilder
 {
@@ -1704,7 +1692,7 @@ AppendIntegerSampleFieldAsJsonImpl(
     char const* format64)
 {
     assert(sb.Room() > 0);
-    PerfDataReader const dataReader(fileBigEndian);
+    PerfByteReader const byteReader(fileBigEndian);
 
     if (fieldMetadata.Array() == PerfFieldArrayNone)
     {
@@ -1719,7 +1707,7 @@ AppendIntegerSampleFieldAsJsonImpl(
             {
                 unsigned const RoomNeeded = 6; // ["0xFF"]
                 sb.EnsureRoom(RoomNeeded);
-                auto val = dataReader.ReadAsU8(fieldRawData.data());
+                auto val = byteReader.ReadAsU8(fieldRawData.data());
                 sb.WritePrintf(RoomNeeded, format32, val);
             }
             break;
@@ -1732,7 +1720,7 @@ AppendIntegerSampleFieldAsJsonImpl(
             {
                 unsigned const RoomNeeded = 8; // ["0xFFFF"]
                 sb.EnsureRoom(RoomNeeded);
-                auto val = dataReader.ReadAsU16(fieldRawData.data());
+                auto val = byteReader.ReadAsU16(fieldRawData.data());
                 sb.WritePrintf(RoomNeeded, format32, val);
             }
             break;
@@ -1745,7 +1733,7 @@ AppendIntegerSampleFieldAsJsonImpl(
             {
                 unsigned const RoomNeeded = 12; // ["0xFFFFFFFF"]
                 sb.EnsureRoom(RoomNeeded);
-                auto val = dataReader.ReadAsU32(fieldRawData.data());
+                auto val = byteReader.ReadAsU32(fieldRawData.data());
                 sb.WritePrintf(RoomNeeded, format32, val);
             }
             break;
@@ -1758,7 +1746,7 @@ AppendIntegerSampleFieldAsJsonImpl(
             {
                 unsigned const RoomNeeded = 20; // ["0xFFFFFFFFFFFFFFFF"]
                 sb.EnsureRoom(RoomNeeded);
-                auto val = dataReader.ReadAsU64(fieldRawData.data());
+                auto val = byteReader.ReadAsU64(fieldRawData.data());
                 sb.WritePrintf(RoomNeeded, format64, val);
             }
             break;
@@ -1778,7 +1766,7 @@ AppendIntegerSampleFieldAsJsonImpl(
                 unsigned const RoomNeeded = 6; // ["0xFF"]
                 sb.EnsureRoom(RoomNeeded + 2);
                 sb.WriteJsonCommaSpaceAsNeeded();
-                sb.WritePrintf(RoomNeeded, format32, dataReader.Read(p));
+                sb.WritePrintf(RoomNeeded, format32, byteReader.Read(p));
             }
             break;
         case PerfFieldElementSize16:
@@ -1787,7 +1775,7 @@ AppendIntegerSampleFieldAsJsonImpl(
                 unsigned const RoomNeeded = 8; // ["0xFFFF"]
                 sb.EnsureRoom(RoomNeeded + 2);
                 sb.WriteJsonCommaSpaceAsNeeded();
-                sb.WritePrintf(RoomNeeded, format32, dataReader.Read(p));
+                sb.WritePrintf(RoomNeeded, format32, byteReader.Read(p));
             }
             break;
         case PerfFieldElementSize32:
@@ -1796,7 +1784,7 @@ AppendIntegerSampleFieldAsJsonImpl(
                 unsigned const RoomNeeded = 12; // ["0xFFFFFFFF"]
                 sb.EnsureRoom(RoomNeeded + 2);
                 sb.WriteJsonCommaSpaceAsNeeded();
-                sb.WritePrintf(RoomNeeded, format32, dataReader.Read(p));
+                sb.WritePrintf(RoomNeeded, format32, byteReader.Read(p));
             }
             break;
         case PerfFieldElementSize64:
@@ -1805,7 +1793,7 @@ AppendIntegerSampleFieldAsJsonImpl(
                 unsigned const RoomNeeded = 20; // ["0xFFFFFFFFFFFFFFFF"]
                 sb.EnsureRoom(RoomNeeded + 2);
                 sb.WriteJsonCommaSpaceAsNeeded();
-                sb.WritePrintf(RoomNeeded, format64, dataReader.Read(p));
+                sb.WritePrintf(RoomNeeded, format64, byteReader.Read(p));
             }
             break;
         }
@@ -1825,7 +1813,7 @@ AppendSampleFieldAsJsonImpl(
     bool fileBigEndian,
     bool wantName)
 {
-    PerfDataReader const dataReader(fileBigEndian);
+    PerfByteReader const byteReader(fileBigEndian);
     auto const fieldRawDataChars = static_cast<char const*>(fieldRawData);
 
     // Note: AppendIntegerSampleFieldAsJsonImpl expects 1 byte reserved for '['.
@@ -1884,7 +1872,8 @@ EventFormatter::AppendSampleAsJson(
     char const* sampleEventName;
     size_t sampleProviderNameLength;
 
-    if (sampleEventInfo.raw_meta && sampleEventInfo.raw_meta->HasEventHeader())
+    if (sampleEventInfo.raw_meta &&
+        sampleEventInfo.raw_meta->Kind() == PerfEventKind::EventHeader)
     {
         // eventheader metadata.
 
@@ -1939,7 +1928,7 @@ EventFormatter::AppendSampleAsJson(
     {
     NotEventHeader:
 
-        PerfDataReader const dataReader(fileBigEndian);
+        PerfByteReader const byteReader(fileBigEndian);
         auto const sampleEventNameColon = strchr(sampleEventInfo.name, ':');
         eventInfoValid = false;
         sampleEventName = sampleEventNameColon ? sampleEventNameColon + 1 : "";

@@ -15,10 +15,11 @@ Basic usage of this API:
 
 - Create a Provider object with a name and an optional group.
 - Use the Provider to get the EventSet with the level and keyword you need.
-- As an optimization, use the Enabled(eventSet) to determine whether anybody
+- As an optimization, use Enabled(eventSet) to determine whether anybody
   is listening for a particular provider + event level + event keyword
-  combination. If nobody is listening, there is no need to build and write an
-  event that nobody will receive.
+  combination. If nobody is listening, you should skip the remaining steps
+  because there is no need to build and write an event that nobody will
+  receive.
 - Use an EventBuilder to build and write the event:
   - Create an EventBuilder.
   - Call eventBuilder.Reset(...) to set the event name and to set the event
@@ -45,17 +46,17 @@ Notes:
     lock for other provider operations like FindSet().
   - Create the provider and do all of the necessary RegisterSet() calls
     before any other threads start using it. Then you can call the const
-    methods like FindSet() on any thread as needed without any lock as long
+    methods like FindSet() as needed on any thread without any lock as long
     as nobody is calling any non-const methods.
   - Use your own thread-safe data structure to keep track of all of the
     EventSets you need. Take a lock if you ever need to register a new set.
 - Each event set maps to one tracepoint name, e.g. if the provider name is
-  "MyCompany_MyComponent", level if verbose (5), and keyword is 0x1f, the
+  "MyCompany_MyComponent", level is verbose (5), and keyword is 0x1f, the
   event set will correspond to a tracepont named
   "user_events:MyCompany_MyComponent_L5K1f".
 - Collect events to a file using a tool such as "perf", e.g.
   "perf record -e user_events:MyCompany_MyComponent_L5K1f".
-- Decode events using a tool such as "decode-perf" (from the samples in the
+- Decode events using a tool such as "decode-perf" (from the tools in the
   libeventheader-decode-cpp library).
 */
 
@@ -89,6 +90,9 @@ Notes:
 #endif
 #ifndef _Outptr_result_bytebuffer_
 #define _Outptr_result_bytebuffer_(size)
+#endif
+#ifndef _Out_opt_
+#define _Out_opt_
 #endif
 
 namespace ehd
@@ -229,7 +233,9 @@ namespace ehd
             }
         };
 
-        std::unordered_map<EventKey, std::shared_ptr<EventSet const>, EventKeyOps, EventKeyOps> m_eventSets;
+        using EventSetMap = std::unordered_map<EventKey, std::shared_ptr<EventSet const>, EventKeyOps, EventKeyOps>;
+
+        EventSetMap m_eventSets;
         tracepoint_provider_state m_providerState;
         eventheader_provider m_provider;
         int m_errno;
@@ -417,7 +423,16 @@ namespace ehd
             std::shared_ptr<EventSet const> result;
 
             EventKey const k = { keyword, static_cast<uint8_t>(level) };
-            auto const emplace_result = m_eventSets.emplace(k, std::shared_ptr<EventSet const>());
+            std::pair<EventSetMap::iterator, bool> emplace_result;
+            try
+            {
+                emplace_result = m_eventSets.emplace(k, std::shared_ptr<EventSet const>());
+            }
+            catch (...)
+            {
+                return result; // nullptr.
+            }
+
             if (!emplace_result.second)
             {
                 result = emplace_result.first->second;
@@ -467,7 +482,16 @@ namespace ehd
             std::shared_ptr<EventSet const> result;
 
             EventKey const k = { keyword, static_cast<uint8_t>(level) };
-            auto const emplace_result = m_eventSets.emplace(k, std::shared_ptr<EventSet const>());
+            std::pair<EventSetMap::iterator, bool> emplace_result;
+            try
+            {
+                emplace_result = m_eventSets.emplace(k, std::shared_ptr<EventSet const>());
+            }
+            catch (...)
+            {
+                return result; // nullptr.
+            }
+
             if (!emplace_result.second)
             {
                 result = emplace_result.first->second;
@@ -737,9 +761,9 @@ namespace ehd
 
         Returns 0 for success. Returns a nonzero errno value for failure. The return
         value is for diagnostic/debugging purposes only and should generally be ignored
-        in retail builds. Returns ENOMEM (12) if out of memory. Returns ERANGE (34) if the
-        event (headers + metadata + data) is greater than 64KB. Returns other errors as
-        reported by writev.
+        in retail builds. Returns EBADF (9) if tracepoint is unregistered or disabled.
+        Returns ENOMEM (12) if out of memory. Returns ERANGE (34) if the event (headers +
+        metadata + data) is greater than 64KB. Returns other errors as reported by writev.
         */
         int
         Write(
@@ -836,6 +860,13 @@ namespace ehd
         - fieldTag is a 16-bit integer that will be recorded in the field and can be
           used for any provider-defined purpose. Use 0 if you are not using field tags.
 
+        - pFieldCountBookmark (advanced): If you don't know how many fields will be in
+          the struct ahead of time, pass 1 for structFieldCount and pass the address of
+          a size_t variable to receive a bookmark. After you have added all of the fields
+          you can then use the bookmark to set the actual structFieldCount value. Note
+          that structFieldCount still cannot be 0 or larger than 127. Use nullptr if
+          you are passing the actual field count in the structFieldCount parameter.
+
         Structs can nest. Each nested struct and its fields count as 1 field for the
         parent struct.
         */
@@ -843,7 +874,52 @@ namespace ehd
         AddStruct(
             std::string_view fieldName,
             uint8_t structFieldCount,
-            uint16_t fieldTag = 0) noexcept
+            uint16_t fieldTag = 0,
+            _Out_opt_ size_t* pFieldCountBookmark = nullptr) noexcept
+        {
+            uint8_t maskedFieldCount = structFieldCount & event_field_format_value_mask;
+            assert(structFieldCount == maskedFieldCount); // Precondition: structFieldCount must be less than 128.
+
+            size_t fieldCountBookmark;
+            if (structFieldCount == 0)
+            {
+                assert(structFieldCount != 0); // Precondition: structFieldCount must not be 0.
+                fieldCountBookmark = -1;
+            }
+            else
+            {
+                fieldCountBookmark = RawAddMeta(fieldName, event_field_encoding_struct, maskedFieldCount, fieldTag);
+            }
+
+            if (pFieldCountBookmark)
+            {
+                *pFieldCountBookmark = fieldCountBookmark;
+            }
+
+            return *this;
+        }
+
+        /*
+        Advanced: Resets the number of logical fields in a structure.
+
+        Requires:
+
+        - fieldCountBookmark is a bookmark value returned by AddStruct, and you
+          haven't called Reset since that bookmark was returned.
+        - structFieldCount is a value from 1 to 127. (Must not be 0. Must be less
+          than 128.)
+
+        If the final number of fields of a structure is not known at the time
+        you need to start the structure, you can follow this procedure:
+
+        - Create a size_t bookmark variable.
+        - In the AddStruct call, pass 1 as the number of fields, and pass &bookmark
+          as the pFieldCountBookmark parameter.
+        - After you know the actual number of fields, call
+          SetStructFieldCount(bookmark, fieldCount).
+        */
+        EventBuilder&
+        SetStructFieldCount(size_t fieldCountBookmark, uint8_t structFieldCount) noexcept
         {
             uint8_t maskedFieldCount = structFieldCount & event_field_format_value_mask;
             assert(structFieldCount == maskedFieldCount); // Precondition: structFieldCount must be less than 128.
@@ -851,10 +927,19 @@ namespace ehd
             if (structFieldCount == 0)
             {
                 assert(structFieldCount != 0); // Precondition: structFieldCount must not be 0.
-                return *this;
+            }
+            else if (fieldCountBookmark < m_meta.size())
+            {
+                auto const pEncoding = m_meta.data() + fieldCountBookmark;
+                *pEncoding = (*pEncoding & 0x80) | maskedFieldCount;
+            }
+            else
+            {
+                // Precondition: fieldCountBookmark must be a valid bookmark from AddStruct.
+                assert(fieldCountBookmark == static_cast<size_t>(-1));
             }
 
-            return RawAddMeta(fieldName, event_field_encoding_struct, maskedFieldCount, fieldTag);
+            return *this;
         }
 
         /*
@@ -927,8 +1012,9 @@ namespace ehd
             uint16_t fieldTag = 0) noexcept
             -> typename ValueEnabled<ValTy>::type // enable_if
         {
-            return RawAddMeta(fieldName, ValueEnabled<ValTy>::ValueEncoding, format, fieldTag)
-                .RawAddDataValue(fieldValue);
+            RawAddMeta(fieldName, ValueEnabled<ValTy>::ValueEncoding, format, fieldTag);
+            RawAddDataValue(fieldValue);
+            return *this;
         }
 
         /*
@@ -970,16 +1056,17 @@ namespace ehd
             -> typename ValueEnabled<typename std::decay<decltype(*fieldBeginIterator)>::type>::type // enable_if
         {
             using ValTy = typename std::decay<decltype(*fieldBeginIterator)>::type;
-            return RawAddMeta(
-                    fieldName,
-                    ValueEnabled<ValTy>::ValueEncoding | event_field_encoding_varray_flag,
-                    format,
-                    fieldTag)
-                .RawAddDataRange(fieldBeginIterator, fieldEndIterator,
-                    [](EventBuilder* pThis, ValTy const& value)
-                    {
-                        pThis->RawAddDataValue(value);
-                    });
+            RawAddMeta(
+                fieldName,
+                ValueEnabled<ValTy>::ValueEncoding | event_field_encoding_varray_flag,
+                format,
+                fieldTag);
+            RawAddDataRange(fieldBeginIterator, fieldEndIterator,
+                [](EventBuilder* pThis, ValTy const& value)
+                {
+                    pThis->RawAddDataValue(value);
+                });
+            return *this;
         }
 
         /*
@@ -1030,8 +1117,9 @@ namespace ehd
             uint16_t fieldTag = 0) noexcept
             -> typename StringEnabled<CharTy>::type // enable_if
         {
-            return RawAddMeta(fieldName, StringEnabled<CharTy>::StringEncoding, format, fieldTag)
-                .RawAddDataCounted(fieldValue);
+            RawAddMeta(fieldName, StringEnabled<CharTy>::StringEncoding, format, fieldTag);
+            RawAddDataCounted(fieldValue);
+            return *this;
         }
 
         /*
@@ -1073,16 +1161,17 @@ namespace ehd
                 std::is_convertible<decltype(*fieldBeginIterator), std::basic_string_view<CharTy>>::value
                 >::type // enable_if
         {
-            return RawAddMeta(
-                    fieldName,
-                    StringEnabled<CharTy>::StringEncoding | event_field_encoding_varray_flag,
-                    format,
-                    fieldTag)
-                .RawAddDataRange(fieldBeginIterator, fieldEndIterator,
-                    [](EventBuilder* pThis, std::basic_string_view<CharTy> value)
-                    {
-                        pThis->RawAddDataCounted(value);
-                    });
+            RawAddMeta(
+                fieldName,
+                StringEnabled<CharTy>::StringEncoding | event_field_encoding_varray_flag,
+                format,
+                fieldTag);
+            RawAddDataRange(fieldBeginIterator, fieldEndIterator,
+                [](EventBuilder* pThis, std::basic_string_view<CharTy> value)
+                {
+                    pThis->RawAddDataCounted(value);
+                });
+            return *this;
         }
 
         /*
@@ -1134,8 +1223,9 @@ namespace ehd
             uint16_t fieldTag = 0) noexcept
             -> typename StringEnabled<CharTy>::type // enable_if
         {
-            return RawAddMeta(fieldName, StringEnabled<CharTy>::ZStringEncoding, format, fieldTag)
-                .RawAddDataNulTerminated(fieldValue);
+            RawAddMeta(fieldName, StringEnabled<CharTy>::ZStringEncoding, format, fieldTag);
+            RawAddDataNulTerminated(fieldValue);
+            return *this;
         }
 
         /*
@@ -1177,16 +1267,17 @@ namespace ehd
                 std::is_convertible<decltype(*fieldBeginIterator), std::basic_string_view<CharTy>>::value
                 >::type // enable_if
         {
-            return RawAddMeta(
-                    fieldName,
-                    StringEnabled<CharTy>::ZStringEncoding | event_field_encoding_varray_flag,
-                    format,
-                    fieldTag)
-                .RawAddDataRange(fieldBeginIterator, fieldEndIterator,
-                    [](EventBuilder* pThis, std::basic_string_view<CharTy> value)
-                    {
-                        pThis->RawAddDataNulTerminated(value);
-                    });
+            RawAddMeta(
+                fieldName,
+                StringEnabled<CharTy>::ZStringEncoding | event_field_encoding_varray_flag,
+                format,
+                fieldTag);
+            RawAddDataRange(fieldBeginIterator, fieldEndIterator,
+                [](EventBuilder* pThis, std::basic_string_view<CharTy> value)
+                {
+                    pThis->RawAddDataNulTerminated(value);
+                });
+            return *this;
         }
 
         /*
@@ -1208,7 +1299,8 @@ namespace ehd
             uint16_t fieldTag = 0) noexcept
         {
             assert(encoding == (encoding & event_field_encoding_value_mask));
-            return RawAddMeta(fieldName, encoding, format, fieldTag);
+            RawAddMeta(fieldName, encoding, format, fieldTag);
+            return *this;
         }
 
         /*
@@ -1230,7 +1322,8 @@ namespace ehd
             uint16_t fieldTag = 0) noexcept
         {
             assert(encoding == (encoding & event_field_encoding_value_mask));
-            return RawAddMeta(fieldName, encoding | event_field_encoding_varray_flag, format, fieldTag);
+            RawAddMeta(fieldName, encoding | event_field_encoding_varray_flag, format, fieldTag);
+            return *this;
         }
 
         /*
@@ -1295,9 +1388,12 @@ namespace ehd
 
     private:
 
-        EventBuilder&
+        // Returns: The offset of the format byte, or -1.
+        size_t
         RawAddMeta(std::string_view fieldName, uint8_t encoding, uint8_t format, uint16_t fieldTag) noexcept
         {
+            size_t formatOffset = -1;
+
             // Precondition violation: fieldName must not contain '\0'.
             assert(fieldName.find('\0') == fieldName.npos);
 
@@ -1321,6 +1417,7 @@ namespace ehd
                     pMeta[cMeta] = encoding | 0x80;
                     cMeta += 1;
                     pMeta[cMeta] = format | 0x80;
+                    formatOffset = m_meta.size() + cMeta;
                     cMeta += 1;
                     memcpy(&pMeta[cMeta], &fieldTag, sizeof(fieldTag));
                     cMeta += sizeof(fieldTag);
@@ -1330,6 +1427,7 @@ namespace ehd
                     pMeta[cMeta] = encoding | 0x80;
                     cMeta += 1;
                     pMeta[cMeta] = format;
+                    formatOffset = m_meta.size() + cMeta;
                     cMeta += 1;
                 }
                 else
@@ -1341,7 +1439,7 @@ namespace ehd
                 m_meta.advance(cMeta);
             }
 
-            return *this;
+            return formatOffset;
         }
 
         template<class CharTy>
